@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.background
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,6 +25,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -136,28 +139,85 @@ fun StepCounterScreen(service: StepCounterService?, modifier: Modifier = Modifie
     
     var showDialog by remember { mutableStateOf(false) }
 
-    Column(
-         modifier = modifier.fillMaxSize(),
-         horizontalAlignment = Alignment.CenterHorizontally,
-         verticalArrangement = Arrangement.Center
-    ) {
-         Text(
-             text = "Today's Steps",
-             style = MaterialTheme.typography.headlineMedium,
-             modifier = Modifier.padding(bottom = 32.dp)
-         )
+    // Vibrant background gradient
+    val backgroundBrush = androidx.compose.ui.graphics.Brush.verticalGradient(
+        colors = listOf(
+            Color(0xFF1E3C72), // Deep Navy
+            Color(0xFF2A5298), // Bright Blue
+            Color(0xFF00C9FF)  // Cyan
+        )
+    )
 
-         CircularProgress(
-             progress = if (stepData.dailyGoal > 0) stepData.dailySteps.toFloat() / stepData.dailyGoal else 0f,
-             steps = stepData.dailySteps,
-             goal = stepData.dailyGoal
-         )
-         
-         Spacer(modifier = Modifier.height(48.dp))
-         
-         Button(onClick = { showDialog = true }) {
-             Text("Set Daily Goal")
-         }
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(backgroundBrush)
+    ) {
+        Column(
+             modifier = Modifier.fillMaxSize().padding(16.dp),
+             horizontalAlignment = Alignment.CenterHorizontally,
+             verticalArrangement = Arrangement.Top
+        ) {
+             Spacer(modifier = Modifier.height(64.dp))
+             
+             Text(
+                 text = "Today's Steps",
+                 style = MaterialTheme.typography.headlineLarge,
+                 color = Color.White.copy(alpha = 0.9f),
+                 fontWeight = FontWeight.Light,
+                 modifier = Modifier.padding(bottom = 48.dp)
+             )
+
+             CircularProgress(
+                 progress = if (stepData.dailyGoal > 0) stepData.dailySteps.toFloat() / stepData.dailyGoal else 0f,
+                 steps = stepData.dailySteps,
+                 goal = stepData.dailyGoal
+             )
+             
+             Spacer(modifier = Modifier.height(32.dp))
+             
+             // Motivational Text
+             val motivationalText = when {
+                 stepData.dailySteps == 0 -> "Let's get moving! 🚶"
+                 stepData.dailySteps >= stepData.dailyGoal -> "Goal Reached! Amazing! 🎉"
+                 stepData.dailySteps.toFloat() / stepData.dailyGoal > 0.8f -> "Almost there! Keep it up! 🏃"
+                 stepData.dailySteps.toFloat() / stepData.dailyGoal > 0.5f -> "Halfway there! Great job! 🙌"
+                 else -> "Keep going! 💪"
+             }
+             
+             Text(
+                 text = motivationalText,
+                 style = MaterialTheme.typography.titleLarge,
+                 color = Color.White,
+                 fontWeight = FontWeight.Medium
+             )
+             
+             Spacer(modifier = Modifier.weight(1f))
+             
+             // Stylish Button
+             ElevatedButton(
+                 onClick = { showDialog = true },
+                 colors = ButtonDefaults.elevatedButtonColors(
+                     containerColor = Color.White,
+                     contentColor = Color(0xFF1E3C72)
+                 ),
+                 elevation = ButtonDefaults.elevatedButtonElevation(
+                     defaultElevation = 8.dp,
+                     pressedElevation = 2.dp
+                 ),
+                 modifier = Modifier
+                    .fillMaxWidth(0.7f)
+                    .height(56.dp),
+                 shape = androidx.compose.foundation.shape.RoundedCornerShape(28.dp)
+             ) {
+                 Text(
+                     "Set Daily Goal",
+                     fontSize = 18.sp,
+                     fontWeight = FontWeight.Bold
+                 )
+             }
+             Spacer(modifier = Modifier.height(32.dp))
+        }
     }
     
     if (showDialog) {
@@ -176,38 +236,65 @@ fun StepCounterScreen(service: StepCounterService?, modifier: Modifier = Modifie
 fun CircularProgress(progress: Float, steps: Int, goal: Int) {
     val animatedProgress = animateFloatAsState(
         targetValue = progress.coerceIn(0f, 1f),
-        label = "progress"
+        label = "progress",
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 1000)
     ).value
     
+    // Gradient for the progress arc
+    val progressBrush = androidx.compose.ui.graphics.Brush.sweepGradient(
+        colors = listOf(
+            Color(0xFF00FF87), // Bright Green
+            Color(0xFF60EFFF)  // Light Blue
+        )
+    )
+    
     Box(contentAlignment = Alignment.Center) {
+        // Outer glow/shadow frame
+        Box(
+            modifier = Modifier
+                .size(280.dp)
+                .background(
+                    color = Color.White.copy(alpha = 0.1f),
+                    shape = androidx.compose.foundation.shape.CircleShape
+                )
+        )
+        
         Canvas(modifier = Modifier.size(250.dp)) {
-            // Background track
+            // Background track (Subtle, semi-transparent white)
             drawArc(
-                color = Color.LightGray.copy(alpha = 0.3f),
+                color = Color.White.copy(alpha = 0.15f),
                 startAngle = 0f,
                 sweepAngle = 360f,
                 useCenter = false,
-                style = Stroke(width = 20.dp.toPx(), cap = StrokeCap.Round)
+                style = Stroke(width = 24.dp.toPx(), cap = StrokeCap.Round)
             )
-            // Progress
-            drawArc(
-                color = Color(0xFF4CAF50), // Nice Green
-                startAngle = -90f,
-                sweepAngle = 360 * animatedProgress,
-                useCenter = false,
-                style = Stroke(width = 20.dp.toPx(), cap = StrokeCap.Round)
-            )
+            // Progress arc
+            // Rotate the canvas so the sweep gradient starts at the top
+            withTransform({
+                rotate(degrees = -90f)
+            }) {
+                drawArc(
+                    brush = progressBrush,
+                    startAngle = 0f,
+                    sweepAngle = 360 * animatedProgress,
+                    useCenter = false,
+                    style = Stroke(width = 24.dp.toPx(), cap = StrokeCap.Round)
+                )
+            }
         }
+        
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
                 text = "$steps", 
-                style = MaterialTheme.typography.displayMedium,
-                fontWeight = FontWeight.Bold
+                style = MaterialTheme.typography.displayLarge.copy(fontSize = 72.sp),
+                color = Color.White,
+                fontWeight = FontWeight.ExtraBold
             )
             Text(
                 text = "/ $goal", 
-                style = MaterialTheme.typography.titleMedium, 
-                color = Color.Gray
+                style = MaterialTheme.typography.headlineSmall, 
+                color = Color.White.copy(alpha = 0.7f),
+                fontWeight = FontWeight.Medium
             )
         }
     }
@@ -219,7 +306,7 @@ fun SetGoalDialog(currentGoal: Int, onDismiss: () -> Unit, onConfirm: (Int) -> U
     
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Set Daily Goal") },
+        title = { Text("Set Daily Goal", fontWeight = FontWeight.Bold) },
         text = {
             OutlinedTextField(
                 value = text,
@@ -230,23 +317,40 @@ fun SetGoalDialog(currentGoal: Int, onDismiss: () -> Unit, onConfirm: (Int) -> U
                 },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 label = { Text("Steps") },
-                singleLine = true
+                singleLine = true,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color(0xFF1E3C72),
+                    focusedLabelColor = Color(0xFF1E3C72),
+                    focusedTextColor = Color.Black,
+                    unfocusedTextColor = Color.DarkGray,
+                    cursorColor = Color(0xFF1E3C72)
+                )
             )
         },
+        containerColor = Color.White,
+        titleContentColor = Color(0xFF1E3C72),
+        textContentColor = Color.DarkGray,
         confirmButton = {
-            TextButton(onClick = { 
-                val newGoal = text.toIntOrNull()
-                if (newGoal != null && newGoal > 0) {
-                    onConfirm(newGoal)
-                }
-            }) {
-                Text("Save")
+            Button(
+                onClick = { 
+                    val newGoal = text.toIntOrNull()
+                    if (newGoal != null && newGoal > 0) {
+                        onConfirm(newGoal)
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E3C72))
+            ) {
+                Text("Save", color = Color.White)
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(
+                onClick = onDismiss,
+                colors = ButtonDefaults.textButtonColors(contentColor = Color.Gray)
+            ) {
                 Text("Cancel")
             }
-        }
+        },
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp)
     )
 }

@@ -174,8 +174,8 @@ class StepCounterService : Service(), SensorEventListener {
                 // This ensures maximum anti-shake protection for this phone, even if it limits compatibility.
                 if (hasStepDetector) {
                     val timeSinceImpact = now - lastDetectorTimestamp
-                    // 3000ms window. If > 3s since last impact, ignore this counter update.
-                    if (timeSinceImpact > 3000) {
+                    // 8000ms window. If > 8s since last impact, ignore this counter update.
+                    if (timeSinceImpact > 8000) {
                         android.util.Log.d("StepCounterService", "Anti-Shake: Rejected Counter update. No impact for ${timeSinceImpact}ms")
                         return // EXIT
                     }
@@ -232,8 +232,8 @@ class StepCounterService : Service(), SensorEventListener {
                 
                 if (timeDelta > 0) {
                     val speed = (diff.toFloat() / timeDelta.toFloat()) * 1000f
-                    // Strict limit: 3.0 steps/sec (180 steps/min is a high cadence run)
-                    if (speed > 3.0f) {
+                    // Relaxed limit: 4.5 steps/sec (270 steps/min accommodates fast walking/jogging)
+                    if (speed > 4.5f) {
                         android.util.Log.d("StepCounterService", "Anti-Shake: Speed too high ($speed). Rejected $diff steps.")
                         isSpeedOk = false
                     }
@@ -245,8 +245,8 @@ class StepCounterService : Service(), SensorEventListener {
                 if (isSpeedOk) {
                     // 2. STEP BUFFERING (Debounce)
                     // If too much time passed since last VALID step, reset buffer (user stopped walking)
-                    // 3000ms = 3 seconds gap allowed
-                    if (now - lastValidStepTime > 3000) {
+                    // 8000ms = 8 seconds gap allowed
+                    if (now - lastValidStepTime > 8000) {
                         android.util.Log.d("StepCounterService", "Anti-Shake: Reset buffer (allowance exceeded)")
                         consecutiveSteps = 0
                     }
