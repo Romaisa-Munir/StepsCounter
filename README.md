@@ -3,7 +3,7 @@
 A clean, highly accurate, privacy-first Android step counter app built with Kotlin and Jetpack Compose.
 
 ## Features
-- **High Accuracy & Anti-Shake:** Uses a custom hardware sensor algorithm with a built-in G-force shake guard. It distinguishes between natural walking and artificial phone shaking.
+- **High Accuracy:** Uses a custom hardware sensor algorithm to count steps reliably.
 - **100% Offline & Private:** No accounts, no data harvesting. All step data is stored locally on your device.
 - **Battery Efficient:** Relies on the low-power `Sensor.TYPE_STEP_COUNTER` to track steps in the background without draining your battery.
 - **Beautiful UI:** A modern, premium interface built with Jetpack Compose featuring dynamic gradients, large typography, and motivational goal tracking.
