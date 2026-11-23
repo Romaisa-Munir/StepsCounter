@@ -1,364 +1,267 @@
 package com.example.stepscounter
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.SharedPreferences
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.Color
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
-import androidx.annotation.RequiresApi
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
+import android.util.Log
 import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import java.time.LocalDate
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import java.text.NumberFormat
 
+/**
+ * Keeps the step counter registered and shows today's total in a notification.
+ *
+ * Battery: TYPE_STEP_COUNTER is counted by the phone's low-power sensor hub, and it is a non-wake-up
+ * sensor, so this service never keeps the CPU awake. While the phone sleeps the hub keeps counting;
+ * the next event carries the full total.
+ */
 class StepCounterService : Service(), SensorEventListener {
 
-    private lateinit var sensorManager: SensorManager
-    private var stepSensor: Sensor? = null
-    private var stepDetector: Sensor? = null
-    private var accelerometer: Sensor? = null // SHAKE GUARD
-    private var hasStepDetector = false
-    private lateinit var sharedPreferences: SharedPreferences
-    private var wakeLock: android.os.PowerManager.WakeLock? = null
-    
-    // In-memory timestamp for detector validation
-    private var lastDetectorTimestamp: Long = 0L
-    // In-memory timestamp for SHAKE GUARD
-    private var lastShakeTimestamp: Long = 0L
+    private var sensorManager: SensorManager? = null
+    private var receiverRegistered = false
+    private var hadReadingSinceStart = false
+    private var bootCount = TrackerState.UNKNOWN
 
-    private val _stepData = MutableStateFlow(StepData(0, 10000))
-    val stepData: StateFlow<StepData> = _stepData.asStateFlow()
+    private val handler = Handler(Looper.getMainLooper())
+    private val scope = MainScope()
+    private lateinit var contentIntent: PendingIntent
+    private var shownData: StepData? = null
+    private var lastNotifyUptime = 0L
+    private val notifyRunnable = Runnable { showLatestNotification() }
 
-    private val binder = LocalBinder()
+    private val systemEvents = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_DATE_CHANGED,
+                Intent.ACTION_TIME_CHANGED,
+                Intent.ACTION_TIMEZONE_CHANGED,
+                Intent.ACTION_SCREEN_ON -> StepStore.refreshDay()
 
-    inner class LocalBinder : Binder() {
-        fun getService(): StepCounterService = this@StepCounterService
+                Intent.ACTION_SCREEN_OFF,
+                Intent.ACTION_SHUTDOWN -> StepStore.saveNow()
+            }
+        }
     }
 
-    override fun onBind(intent: Intent): IBinder {
-        return binder
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        
-        // Acquire WakeLock
-        val powerManager = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        wakeLock = powerManager.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "StepCounterService::WakeLock")
-        wakeLock?.acquire()
-        android.util.Log.d("StepCounterService", "WakeLock acquired")
-
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
-        stepDetector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        hasStepDetector = (stepDetector != null)
-        
-        sharedPreferences = getSharedPreferences("step_prefs", Context.MODE_PRIVATE)
-        // Restore detector timestamp just in case
-        lastDetectorTimestamp = sharedPreferences.getLong("last_detector_timestamp", 0L)
-
+        StepStore.init(this)
+        contentIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         createNotificationChannel()
-        startForegroundService()
-
-        loadData()
-        
-        registerSensor()
-
-        // Heartbeat / Watchdog
-        val timer = java.util.Timer()
-        timer.scheduleAtFixedRate(object : java.util.TimerTask() {
-            override fun run() {
-                val now = System.currentTimeMillis()
-                val lastUpdate = sharedPreferences.getLong("last_event_timestamp", now)
-                
-                android.util.Log.d("StepCounterService", "Heartbeat. Last event: ${now - lastUpdate}ms ago")
-                
-                // If no steps for 60 seconds, kick the sensor
-                if (now - lastUpdate > 60000) {
-                    android.util.Log.d("StepCounterService", "Watchdog: Re-registering sensor...")
-                    sensorManager.unregisterListener(this@StepCounterService)
-                    registerSensor()
-                    // Update timestamp to avoid kicking constantly if user is just sitting
-                    sharedPreferences.edit().putLong("last_event_timestamp", now).apply()
-                }
-            }
-        }, 5000, 5000)
-    }
-
-    private fun registerSensor() {
-        if (stepSensor == null) {
-            android.util.Log.e("StepCounterService", "Step Counter Sensor is NULL!")
-        } else {
-            android.util.Log.d("StepCounterService", "Registering Step Counter...")
-            val result = sensorManager.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_GAME, 0)
-            android.util.Log.d("StepCounterService", "Step Counter Register result: $result")
+        if (!enterForeground()) {
+            stopSelf()
+            return
         }
-        
-        if (stepDetector != null) {
-             android.util.Log.d("StepCounterService", "Registering Step Detector...")
-             val resultDetector = sensorManager.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_GAME, 0)
-             android.util.Log.d("StepCounterService", "Step Detector Register result: $resultDetector")
-        } else {
-             android.util.Log.w("StepCounterService", "No Step Detector found! Falling back to Counter only.")
+
+        val manager = getSystemService(SensorManager::class.java)
+        val counter = manager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+        if (counter == null) {
+            Log.e(TAG, "This device has no step counter sensor")
+            stopSelf()
+            return
         }
-        
-        if (accelerometer != null) {
-            android.util.Log.d("StepCounterService", "Registering Accelerometer (Shake Guard)...")
-            val resultAcc = sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_UI, 0) // UI speed is enough for shake det (60ms)
+        bootCount = Settings.Global.getInt(contentResolver, Settings.Global.BOOT_COUNT, TrackerState.UNKNOWN)
+        // On-change sensor: the rate is ignored, and no batching keeps updates instant while the
+        // screen is on.
+        if (!manager.registerListener(this, counter, SensorManager.SENSOR_DELAY_NORMAL)) {
+            Log.e(TAG, "Could not register the step counter")
+            stopSelf()
+            return
         }
+        sensorManager = manager
+
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_DATE_CHANGED)
+            addAction(Intent.ACTION_TIME_CHANGED)
+            addAction(Intent.ACTION_TIMEZONE_CHANGED)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SHUTDOWN)
+        }
+        ContextCompat.registerReceiver(this, systemEvents, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        receiverRegistered = true
+
+        scope.launch { StepStore.data.collect { scheduleNotificationUpdate() } }
+        Log.i(TAG, "Tracking started (boot #$bootCount)")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForegroundService()
-        // Redeliver intent if killed
+        // Each startForegroundService() call must be answered with startForeground().
+        if (sensorManager == null || !enterForeground()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
-    private fun startForegroundService() {
-        val notification = createNotification()
-        try {
-            if (Build.VERSION.SDK_INT >= 34) {
-                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
-            } else {
-                startForeground(1, notification)
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
     override fun onSensorChanged(event: SensorEvent?) {
-        event?.let {
-            val now = System.currentTimeMillis()
-            
-            if (it.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-                // SHAKE GUARD LOGIC
-                val x = it.values[0]
-                val y = it.values[1]
-                val z = it.values[2]
-                val gForce = Math.sqrt((x * x + y * y + z * z).toDouble())
-                
-                // 20 m/s^2 is approx 2G. Violent shaking exceeds this. Walking is usually 1.2-1.5G.
-                if (gForce > 20.0) {
-                     android.util.Log.d("StepCounterService", "SHAKE GUARD: High G-Force Detected! ($gForce). Blocking steps for 2s.")
-                     lastShakeTimestamp = now
-                }
-            } else if (it.sensor.type == Sensor.TYPE_STEP_DETECTOR) {
-                // IMPACT DETECTED!
-                lastDetectorTimestamp = now
-            } else if (it.sensor.type == Sensor.TYPE_STEP_COUNTER) {
-                // COUNTER UPDATE
-                
-                // SHAKE GUARD CHECK
-                if (now - lastShakeTimestamp < 2000) {
-                     android.util.Log.d("StepCounterService", "Anti-Shake: Rejected Counter update. Shake Guard ACTIVE.")
-                     return // EXIT
-                }
-                
-                // VALIDATION:
-                // Re-enabled strict check for user's specific device (Redmi Note 14).
-                // This ensures maximum anti-shake protection for this phone, even if it limits compatibility.
-                if (hasStepDetector) {
-                    val timeSinceImpact = now - lastDetectorTimestamp
-                    // 8000ms window. If > 8s since last impact, ignore this counter update.
-                    if (timeSinceImpact > 8000) {
-                        android.util.Log.d("StepCounterService", "Anti-Shake: Rejected Counter update. No impact for ${timeSinceImpact}ms")
-                        return // EXIT
-                    }
-                }
-                
-                val rawSteps = it.values[0].toInt()
-                // Update timestamp for watchdog
-                sharedPreferences.edit().putLong("last_event_timestamp", now).apply()
-                handleStepUpdate(rawSteps)
-            }
-        }
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        // No-op
-    }
-
-    private fun handleStepUpdate(currentSensorValue: Int) {
-        val currentDate = LocalDate.now().toString()
-        val savedDate = sharedPreferences.getString("saved_date", "1970-01-01")!!
-        var dailySteps = sharedPreferences.getInt("daily_steps", 0)
-        var lastSensorValue = sharedPreferences.getInt("last_sensor_value", -1) 
-        var lastEventTime = sharedPreferences.getLong("last_event_timestamp_ms", 0L) // For speed calc
-        var lastValidStepTime = sharedPreferences.getLong("last_valid_step_timestamp", 0L) // For debounce reset
-        var consecutiveSteps = sharedPreferences.getInt("consecutive_steps", 0) // Buffer
-
+        if (event == null || event.sensor.type != Sensor.TYPE_STEP_COUNTER) return
         val now = System.currentTimeMillis()
+        val reading = CounterReading(
+            counter = event.values[0].toLong(),
+            timeMillis = eventWallClock(event.timestamp, now),
+            bootCount = bootCount,
+            bootTimeMillis = now - SystemClock.elapsedRealtime(),
+            continuous = hadReadingSinceStart,
+        )
+        hadReadingSinceStart = true
+        val result = StepStore.onReading(reading)
+        Log.d(TAG, "counter=${reading.counter} ${result.outcome} +${result.credited} today=${result.state.dailySteps}")
+    }
 
-        // Day change check
-        if (currentDate != savedDate) {
-             dailySteps = 0
-             lastSensorValue = currentSensorValue
-             consecutiveSteps = 0
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    override fun onDestroy() {
+        sensorManager?.unregisterListener(this)
+        sensorManager = null
+        if (receiverRegistered) {
+            unregisterReceiver(systemEvents)
+            receiverRegistered = false
         }
+        scope.cancel()
+        handler.removeCallbacksAndMessages(null)
+        StepStore.saveNow()
+        Log.i(TAG, "Tracking stopped")
+        super.onDestroy()
+    }
 
-        var diff = 0
-        
-        if (lastSensorValue == -1) {
-            // First run
-            diff = 0
-            lastSensorValue = currentSensorValue
-            lastEventTime = now
-            lastValidStepTime = now
+    /** Sensor timestamps are nanoseconds since boot; convert to wall-clock time. */
+    private fun eventWallClock(timestampNanos: Long, nowMillis: Long): Long {
+        val ageMillis = (SystemClock.elapsedRealtimeNanos() - timestampNanos) / 1_000_000L
+        return if (ageMillis in 0..MAX_EVENT_AGE_MS) nowMillis - ageMillis else nowMillis
+    }
+
+    private fun enterForeground(): Boolean = try {
+        val data = StepStore.data.value
+        val notification = buildNotification(data)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
         } else {
-            diff = currentSensorValue - lastSensorValue
-            
-            if (diff < 0) {
-                // Reboot
-                diff = currentSensorValue
-            } else if (diff > 0) {
-                // 1. SPEED FILTER
-                val timeDelta = now - lastEventTime
-                var isSpeedOk = true
-                
-                if (timeDelta > 0) {
-                    val speed = (diff.toFloat() / timeDelta.toFloat()) * 1000f
-                    // Relaxed limit: 4.5 steps/sec (270 steps/min accommodates fast walking/jogging)
-                    if (speed > 4.5f) {
-                        android.util.Log.d("StepCounterService", "Anti-Shake: Speed too high ($speed). Rejected $diff steps.")
-                        isSpeedOk = false
-                    }
-                }
-                
-                // CRITICAL: Update lastEventTime regardless of validity to track cadence correctly
-                lastEventTime = now
-
-                if (isSpeedOk) {
-                    // 2. STEP BUFFERING (Debounce)
-                    // If too much time passed since last VALID step, reset buffer (user stopped walking)
-                    // 8000ms = 8 seconds gap allowed
-                    if (now - lastValidStepTime > 8000) {
-                        android.util.Log.d("StepCounterService", "Anti-Shake: Reset buffer (allowance exceeded)")
-                        consecutiveSteps = 0
-                    }
-
-                    // Accumulate current batch
-                    val prevConsecutive = consecutiveSteps
-                    consecutiveSteps += diff
-                    lastValidStepTime = now
-
-                    // 3. APPLY TO TOTAL
-                    // Rule: Only count steps if we have at least 10 consecutive steps
-                    if (consecutiveSteps >= 10) {
-                        var stepsToAdd = 0
-                        
-                        if (prevConsecutive < 10) {
-                            // TRANSITION: We just crossed the threshold.
-                            // Add the entire buffer (the first 9 steps + current batch)
-                            stepsToAdd = consecutiveSteps
-                            android.util.Log.d("StepCounterService", "Anti-Shake: Threshold reached! Committing buffer: $stepsToAdd")
-                        } else {
-                            // Already walking, just add the new difference
-                            stepsToAdd = diff
-                            android.util.Log.d("StepCounterService", "Anti-Shake: Walking... adding $stepsToAdd")
-                        }
-                        
-                        dailySteps += stepsToAdd
-                    } else {
-                        android.util.Log.d("StepCounterService", "Anti-Shake: Buffering... ($consecutiveSteps/10)")
-                    }
-                } else {
-                    // Speed reject: treat as noise, do not increment buffer
-                    diff = 0
-                }
-            }
+            startForeground(NOTIFICATION_ID, notification)
         }
-        
-        // Sanity check
-        if (diff > 10000) {
-             diff = 0 // Ignore massive spikes
-        }
-
-        // Always save state
-        sharedPreferences.edit()
-             .putInt("last_sensor_value", currentSensorValue)
-             .putInt("daily_steps", dailySteps)
-             .putString("saved_date", currentDate)
-             .putLong("last_event_timestamp_ms", lastEventTime)
-             .putLong("last_valid_step_timestamp", lastValidStepTime)
-             .putInt("consecutive_steps", consecutiveSteps)
-             .apply()
-
-        // Update UI
-        val dailyGoal = sharedPreferences.getInt("daily_goal", 10000)
-        _stepData.value = StepData(dailySteps, dailyGoal)
-        updateNotification()
-    }
-    
-    private fun loadData() {
-        val dailySteps = sharedPreferences.getInt("daily_steps", 0)
-        val dailyGoal = sharedPreferences.getInt("daily_goal", 10000)
-        _stepData.value = StepData(dailySteps, dailyGoal)
+        shownData = data
+        lastNotifyUptime = SystemClock.uptimeMillis()
+        true
+    } catch (e: Exception) {
+        // Missing Physical activity permission, or started from the background where not allowed.
+        Log.e(TAG, "Could not start in the foreground", e)
+        false
     }
 
-    fun setDailyGoal(newGoal: Int) {
-        sharedPreferences.edit().putInt("daily_goal", newGoal).apply()
-        // Update flow
-        val currentSteps = _stepData.value.dailySteps
-        _stepData.value = StepData(currentSteps, newGoal)
+    /** At most one notification update every [NOTIFY_INTERVAL_MS]; each one costs System UI work. */
+    private fun scheduleNotificationUpdate() {
+        handler.removeCallbacks(notifyRunnable)
+        val wait = NOTIFY_INTERVAL_MS - (SystemClock.uptimeMillis() - lastNotifyUptime)
+        if (wait <= 0) showLatestNotification() else handler.postDelayed(notifyRunnable, wait)
+    }
+
+    private fun showLatestNotification() {
+        val data = StepStore.data.value
+        if (data == shownData) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(data))
+        shownData = data
+        lastNotifyUptime = SystemClock.uptimeMillis()
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                "step_counter_channel",
-                "Step Counter Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(serviceChannel)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            getString(R.string.notification_channel_name),
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = getString(R.string.notification_channel_description)
+            setShowBadge(false)
         }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun createNotification(): Notification {
-        val notificationIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            notificationIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        return NotificationCompat.Builder(this, "step_counter_channel")
-            .setContentTitle("Steps Counter Active")
-            .setContentText("Counting steps: ${_stepData.value.dailySteps}")
-            .setSmallIcon(R.mipmap.ic_launcher) // Ensure this icon exists
-            .setContentIntent(pendingIntent)
+    private fun buildNotification(data: StepData): Notification {
+        val format = NumberFormat.getIntegerInstance()
+        val steps = data.dailySteps
+        val goal = data.dailyGoal.coerceAtLeast(1)
+        val text = if (steps >= goal) {
+            getString(R.string.notification_goal_reached)
+        } else {
+            getString(R.string.notification_goal_progress, steps * 100 / goal, format.format(goal))
+        }
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_steps)
+            .setColor(ContextCompat.getColor(this, R.color.pixel_amber))
+            .setContentTitle(resources.getQuantityString(R.plurals.notification_steps_today, steps, format.format(steps)))
+            .setContentText(text)
+            .setProgress(goal, steps.coerceAtMost(goal), false)
+            .setContentIntent(contentIntent)
+            .setCategory(NotificationCompat.CATEGORY_WORKOUT)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setOngoing(true)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
             .build()
     }
 
-    private fun updateNotification() {
-        val notification = createNotification()
-        val mNotificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        mNotificationManager.notify(1, notification)
-    }
+    companion object {
+        private const val TAG = "StepCounterService"
+        private const val CHANNEL_ID = "step_counter_channel"
+        private const val NOTIFICATION_ID = 1
+        private const val NOTIFY_INTERVAL_MS = 3_000L
+        private const val MAX_EVENT_AGE_MS = 60 * 60 * 1000L
 
-    override fun onDestroy() {
-        super.onDestroy()
-        sensorManager.unregisterListener(this)
-        wakeLock?.release()
-        android.util.Log.d("StepCounterService", "WakeLock released")
+        fun hasActivityPermission(context: Context): Boolean =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.ACTIVITY_RECOGNITION) ==
+                PackageManager.PERMISSION_GRANTED
+
+        /** Starts tracking if allowed. Safe to call repeatedly. */
+        fun start(context: Context): Boolean {
+            if (!hasActivityPermission(context)) return false
+            return try {
+                ContextCompat.startForegroundService(context, Intent(context, StepCounterService::class.java))
+                true
+            } catch (e: IllegalStateException) {
+                // ForegroundServiceStartNotAllowedException: started from the background.
+                Log.w(TAG, "Not allowed to start tracking right now", e)
+                false
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Not allowed to start tracking", e)
+                false
+            }
+        }
     }
 }
-
-data class StepData(val dailySteps: Int, val dailyGoal: Int)

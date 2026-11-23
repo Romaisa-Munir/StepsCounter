@@ -7,4 +7,7 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <!-- Matches PixelColors.Night so launch doesn't flash white. -->
+    <color name="pixel_night">#FF1F1424</color>
+    <color name="pixel_amber">#FFFFB347</color>
 </resources>

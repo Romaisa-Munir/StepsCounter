@@ -12,7 +12,8 @@ android {
 
     defaultConfig {
         applicationId = "com.example.stepscounter"
-        minSdk = 24
+        // java.time (used for day boundaries) needs API 26.
+        minSdk = 26
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
